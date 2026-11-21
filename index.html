@@ -62,6 +62,9 @@
       <label class="btn" for="file">…or choose / drop a PDF file</label>
       <input id="file" type="file" accept="application/pdf,.pdf" class="hidden">
       <button type="button" id="pasteTxt">Or paste plain text</button>
+      <span class="row" style="margin-left:auto;gap:6px;color:var(--muted);font-size:.9rem">Pages
+        <input id="pFrom" type="number" min="1" placeholder="first" style="width:70px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)">to
+        <input id="pTo" type="number" min="1" placeholder="last" style="width:70px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)"></span>
     </div>
     <div class="status" id="status" role="status"></div>
     <button type="button" id="cancel" class="hidden" style="margin-top:8px">Stop OCR &amp; keep what's read so far</button>
@@ -164,8 +167,10 @@
   async function extractInner(bytes) {
     const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
     const pages = [];
-    for (let n = 1; n <= pdf.numPages; n++) {
-      setStatus(`Reading page ${n} of ${pdf.numPages}…`);
+    const first = Math.max(1, Math.min(pdf.numPages, parseInt($('pFrom').value) || 1));
+    const last = Math.max(first, Math.min(pdf.numPages, parseInt($('pTo').value) || pdf.numPages));
+    for (let n = first; n <= last; n++) {
+      setStatus(`Reading page ${n} of ${last}…`);
       const page = await pdf.getPage(n);
       const content = await page.getTextContent();
       let out = '', prevY = null;
@@ -184,7 +189,7 @@
       }
       if (out.trim().length < 20 && !cancelOcr) {
         $('cancel').classList.remove('hidden');
-        setStatus(`Page ${n} of ${pdf.numPages} is an image, running OCR (this takes a few seconds per page)…`);
+        setStatus(`Page ${n} of ${last} is an image, running OCR (a few seconds per page; use the page range boxes to do a chapter at a time)…`);
         out = await ocrPage(page);
       }
       pages.push(out);
