@@ -64,7 +64,8 @@
       <button type="button" id="pasteTxt">Or paste plain text</button>
     </div>
     <div class="status" id="status" role="status"></div>
-    <div class="hint">Some sites block downloads from other websites (CORS). If a direct fetch fails, the app automatically retries through a public proxy. For private or sensitive PDFs, use the file picker instead so nothing leaves your device.</div>
+    <button type="button" id="cancel" class="hidden" style="margin-top:8px">Stop OCR &amp; keep what's read so far</button>
+    <div class="hint">Scanned PDFs (images of text) are read automatically with OCR, English only; it takes a few seconds per page. Big file (30 MB+)? Download links often go through a size-limited proxy, so save the PDF and use the file picker, which has no size limit. Some sites block downloads from other websites (CORS). If a direct fetch fails, the app automatically retries through a public proxy. For private or sensitive PDFs, use the file picker instead so nothing leaves your device.</div>
   </section>
 
   <section class="card hidden" id="reader">
@@ -101,6 +102,7 @@
 </main>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
 <script>
 (() => {
   const $ = id => document.getElementById(id);
@@ -116,27 +118,50 @@
   ];
   async function grab(url) {
     const r = await fetch(url);
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    return new Uint8Array(await r.arrayBuffer());
+    const bytes = new Uint8Array(await r.arrayBuffer());
+    if (!r.ok || !looksLikePdf(bytes)) {
+      let said = '';
+      try { said = new TextDecoder().decode(bytes.slice(0, 300)).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 140); } catch (_) {}
+      throw new Error((r.ok ? 'Not a PDF' : 'HTTP ' + r.status) + (said ? ` ("${said}")` : ''));
+    }
+    return bytes;
   }
   const looksLikePdf = b => b && b.length > 4 && b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46; // %PDF
   async function fetchPdf(url) {
     const attempts = [['direct', u => u], ...PROXIES.map((p, i) => ['proxy ' + (i + 1), p])];
-    let lastErr;
+    const errs = [];
     for (const [name, make] of attempts) {
       try {
         setStatus(name === 'direct' ? 'Downloading PDF…' : `Direct download blocked, trying ${name}…`);
         const bytes = await grab(make(url));
-        if (!looksLikePdf(bytes)) throw new Error('That link did not return a PDF');
         return bytes;
-      } catch (e) { lastErr = e; }
+      } catch (e) { errs.push(e.message || String(e)); }
     }
-    throw new Error((lastErr && lastErr.message ? lastErr.message + '. ' : '') + 'Could not download it. Save the PDF and use the file picker instead.');
+    const why = errs.find(m => !/failed to fetch|networkerror|load failed/i.test(m)) || errs[errs.length - 1];
+    throw new Error('Download failed' + (why ? ' (' + why + ')' : '') + '. Save the PDF and use the file picker instead (no size limit).');
   }
 
   // ---------- Extraction ----------
+  let cancelOcr = false, ocrWorker = null;
+  $('cancel').addEventListener('click', () => { cancelOcr = true; $('cancel').classList.add('hidden'); setStatus('Stopping OCR…'); });
+  async function ocrPage(page) {
+    if (!window.Tesseract) throw new Error('OCR engine failed to load (check your connection).');
+    if (!ocrWorker) ocrWorker = await Tesseract.createWorker('eng');
+    const base = page.getViewport({ scale: 1 });
+    const vp = page.getViewport({ scale: Math.min(2.5, 2200 / Math.max(base.width, base.height)) });
+    const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
+    await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
+    const { data } = await ocrWorker.recognize(c);
+    c.width = c.height = 0;
+    return data.text || '';
+  }
   async function extract(bytes) {
     if (!window.pdfjsLib) throw new Error('PDF engine failed to load (check your connection).');
+    cancelOcr = false;
+    try { return await extractInner(bytes); }
+    finally { $('cancel').classList.add('hidden'); if (ocrWorker) { try { await ocrWorker.terminate(); } catch (_) {} ocrWorker = null; } }
+  }
+  async function extractInner(bytes) {
     const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
     const pages = [];
     for (let n = 1; n <= pdf.numPages; n++) {
@@ -156,6 +181,11 @@
         out += it.str;
         if (it.str.trim()) prevY = y;
         if (it.hasEOL && !out.endsWith('\n')) out += '\n';
+      }
+      if (out.trim().length < 20 && !cancelOcr) {
+        $('cancel').classList.remove('hidden');
+        setStatus(`Page ${n} of ${pdf.numPages} is an image, running OCR (this takes a few seconds per page)…`);
+        out = await ocrPage(page);
       }
       pages.push(out);
     }
@@ -181,7 +211,7 @@
   // ---------- Pipeline ----------
   async function handleBytes(bytes) {
     const text = await extract(bytes);
-    if (!text) throw new Error('No selectable text found. This PDF may be a scan (images only).');
+    if (!text) throw new Error('No text found, even with OCR. The scan may be too faint, or not in English.');
     $('text').value = text;
     $('textCard').classList.remove('hidden');
     loadForReading(text);
