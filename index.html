@@ -74,7 +74,7 @@
   <section class="card hidden" id="reader">
     <div class="stage"><div id="word"><span class="l"></span><span class="p">Ready</span><span class="r"></span></div></div>
     <input type="range" id="seek" min="0" max="0" value="0" aria-label="Position">
-    <div class="meta"><span id="pos">0 / 0</span><span id="eta"></span></div>
+    <div class="meta"><span id="pos">0 / 0</span><span id="live" style="color:var(--accent)"></span><span id="eta"></span></div>
     <div class="controls">
       <button id="back10" title="Back 10 words (←)">⏪ 10</button>
       <button id="prev" title="Previous word">◀</button>
@@ -158,15 +158,16 @@
     c.width = c.height = 0;
     return data.text || '';
   }
-  async function extract(bytes) {
+  async function extract(bytes, onPage) {
     if (!window.pdfjsLib) throw new Error('PDF engine failed to load (check your connection).');
     cancelOcr = false;
-    try { return await extractInner(bytes); }
+    try { return await extractInner(bytes, onPage); }
     finally { $('cancel').classList.add('hidden'); if (ocrWorker) { try { await ocrWorker.terminate(); } catch (_) {} ocrWorker = null; } }
   }
-  async function extractInner(bytes) {
+  const clean = t => t.replace(/(\w)-\n(?=[a-z])/g, '$1').replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/(?<!\n)\n(?!\n)/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+  async function extractInner(bytes, onPage) {
     const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
-    const pages = [];
+    let acc = '';
     const first = Math.max(1, Math.min(pdf.numPages, parseInt($('pFrom').value) || 1));
     const last = Math.max(first, Math.min(pdf.numPages, parseInt($('pTo').value) || pdf.numPages));
     for (let n = first; n <= last; n++) {
@@ -192,16 +193,11 @@
         setStatus(`Page ${n} of ${last} is an image, running OCR (a few seconds per page; use the page range boxes to do a chapter at a time)…`);
         out = await ocrPage(page);
       }
-      pages.push(out);
+      const cleaned = clean(out);
+      if (cleaned) { acc += (acc ? '\n\n' : '') + cleaned; }
+      if (onPage) onPage(acc, cleaned, n, last);
     }
-    let text = pages.join('\n\n');
-    text = text.replace(/(\w)-\n(?=[a-z])/g, '$1')      // join hyphenated line breaks
-              .replace(/[ \t]+/g, ' ')
-              .replace(/ ?\n ?/g, '\n')
-              .replace(/(?<!\n)\n(?!\n)/g, ' ')          // single newline → space
-              .replace(/\n{3,}/g, '\n\n')
-              .trim();
-    return text;
+    return acc;
   }
 
   // ---------- Clipboard ----------
@@ -215,15 +211,25 @@
 
   // ---------- Pipeline ----------
   async function handleBytes(bytes) {
-    const text = await extract(bytes);
+    let started = false, text = '';
+    extracting = true;
+    try {
+      text = await extract(bytes, (acc, added, n, last) => {
+        if (!acc) return;
+        $('text').value = acc; $('textCard').classList.remove('hidden');
+        if (!started) { started = true; loadForReading(acc); setStatus('✓ First pages are ready: press Play now, the rest keeps loading in the background.', 'ok'); }
+        else appendWords(added);
+        $('live').textContent = n < last ? `⏳ loading page ${n}/${last}…` : '';
+      });
+    } finally { extracting = false; $('live').textContent = ''; }
     if (!text) throw new Error('No text found, even with OCR. The scan may be too faint, or not in English.');
     $('text').value = text;
-    $('textCard').classList.remove('hidden');
-    loadForReading(text);
-    const words = text.split(/\s+/).length;
+    if (!started) loadForReading(text);
+    const wc = text.split(/\s+/).length;
+    $('count').textContent = `(${wc.toLocaleString()} words)`;
     const copied = await copyText(text);
-    setStatus(copied ? `✓ Copied ${words.toLocaleString()} words to your clipboard. Ready to read!`
-                     : `Extracted ${words.toLocaleString()} words. Auto-copy was blocked, so press “Copy again”.`, copied ? 'ok' : '');
+    setStatus(copied ? `✓ Done: copied ${wc.toLocaleString()} words to your clipboard.`
+                     : `Done: ${wc.toLocaleString()} words extracted. Auto-copy was blocked, so press “Copy again”.`, copied ? 'ok' : '');
   }
   async function run(fn) {
     $('go').disabled = true;
@@ -247,7 +253,7 @@
   $('useText').addEventListener('click', () => loadForReading($('text').value));
 
   // ---------- Speed reader ----------
-  let words = [], idx = 0, timer = null, playing = false;
+  let words = [], idx = 0, timer = null, playing = false, extracting = false;
   const wordEl = $('word'), seek = $('seek');
   const store = { get(k, d) { try { return localStorage.getItem(k) ?? d; } catch (_) { return d; } }, set(k, v) { try { localStorage.setItem(k, v); } catch (_) {} } };
   $('wpm').value = store.get('sr_wpm', 350); $('fs').value = store.get('sr_fs', 52);
@@ -271,16 +277,22 @@
   }
   function tick() {
     if (!playing) return;
-    if (idx >= words.length - 1) return pause();
+    if (idx >= words.length - 1) { if (extracting) { timer = setTimeout(tick, 300); return; } return pause(); }
     idx++; show(); timer = setTimeout(tick, delayFor(words[idx]));
   }
   function play() {
     if (!words.length) return;
-    if (idx >= words.length - 1) idx = 0;
+    if (idx >= words.length - 1 && !extracting) idx = 0;
     playing = true; $('play').textContent = '⏸ Pause'; show(); timer = setTimeout(tick, delayFor(words[idx]));
   }
   function pause() { playing = false; clearTimeout(timer); $('play').textContent = '▶ Play'; }
   function jump(n) { idx = Math.max(0, Math.min(words.length - 1, n)); show(); if (playing) { clearTimeout(timer); timer = setTimeout(tick, delayFor(words[idx])); } }
+  function appendWords(t) {
+    for (const w of t.split(/\s+/)) if (w) words.push(w);
+    seek.max = Math.max(0, words.length - 1);
+    $('count').textContent = `(${words.length.toLocaleString()} words)`;
+    $('pos').textContent = `${Math.min(idx + 1, words.length).toLocaleString()} / ${words.length.toLocaleString()}`;
+  }
   function loadForReading(text) {
     pause();
     words = text.split(/\s+/).filter(Boolean); idx = 0;
