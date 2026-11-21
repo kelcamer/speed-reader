@@ -62,6 +62,7 @@
       <label class="btn" for="file">…or choose / drop a PDF file</label>
       <input id="file" type="file" accept="application/pdf,.pdf" class="hidden">
       <button type="button" id="pasteTxt">Or paste plain text</button>
+      <label style="display:flex;gap:6px;align-items:center;font-size:.9rem;color:var(--muted)" title="Drops stray symbols, page numbers, specks and low-confidence OCR gibberish"><input type="checkbox" id="scrub" checked>Clean up junk text</label>
       <span class="row" style="margin-left:auto;gap:6px;color:var(--muted);font-size:.9rem">Pages
         <input id="pFrom" type="number" min="1" placeholder="first" style="width:70px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)">to
         <input id="pTo" type="number" min="1" placeholder="last" style="width:70px;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)"></span>
@@ -156,6 +157,10 @@
     await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
     const { data } = await ocrWorker.recognize(c);
     c.width = c.height = 0;
+    if ($('scrub').checked && data.lines && data.lines.length) {
+      // keep words the OCR is sure about, plus low-scoring ones that still look like plain words (a speck can zero a real word)
+      return data.lines.map(l => l.words.filter(w => w.confidence >= 30 || (/^\p{L}{3,}[.,;:!?”’")]*$/u.test(w.text) && /[aeiouyAEIOUY]/.test(w.text))).map(w => w.text).join(' ')).join('\n');
+    }
     return data.text || '';
   }
   async function extract(bytes, onPage) {
@@ -163,6 +168,37 @@
     cancelOcr = false;
     try { return await extractInner(bytes, onPage); }
     finally { $('cancel').classList.add('hidden'); if (ocrWorker) { try { await ocrWorker.terminate(); } catch (_) {} ocrWorker = null; } }
+  }
+  const OK_EDGE = '\\p{L}\\p{N}';
+  const lead = new RegExp(`^[^${OK_EDGE}"'“‘(\\[\\-–—$]+`, 'u'), trail = new RegExp(`[^${OK_EDGE}.,;:!?"'”’)\\]%\\-–—]+$`, 'u');
+  const NO_VOWEL_OK = new Set('mr mrs ms dr st vs hm hmm mm shh psst tsk nth brr pm cf ch pp pt ft hr hrs lb lbs mph kph km cm mg kg tbsp tsp thx'.split(' '));
+  function cleanToken(t) {
+    const junk = (t.match(/[|\\~^_`{}<>*#@=+]/g) || []).length;
+    if (junk >= 2) return '';                                             // symbol-riddled token
+    t = t.replace(/[|\\~^_`{}<>*#@=+\u00a0\u00ad]+/g, '').replace(lead, '').replace(trail, '');
+    if (!/[\p{L}\p{N}]/u.test(t)) return '';                              // pure punctuation / symbols
+    const core = t.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, '');   // word without edge punctuation
+    const alnum = (core.match(/[\p{L}\p{N}]/gu) || []).length;
+    if (alnum / core.length < 0.6) return '';                             // mostly symbols inside
+    if (alnum === 1 && !/^[aAI\d]$/.test(core)) return '';                // stray single letters
+    if (/\p{L}\d\p{L}|\d\p{L}\d/u.test(t)) return '';                    // letter/digit soup like "l1ke8"
+    if (/(.)\1{3,}/u.test(t)) return '';                                  // "eeee", "....."
+    if (t.length > 30 && !/-/.test(t)) return '';                         // endless strings
+    if (/^\p{L}{2,}$/u.test(core) && !/[aeiouyAEIOUY]/.test(core) && core !== core.toUpperCase() && !NO_VOWEL_OK.has(core.toLowerCase())) return ''; // vowel-less gibberish (keeps NBC, Mr, hmm…)
+    return t;
+  }
+  function scrub(raw) {
+    const out = [];
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) { out.push(''); continue; }
+      if (/^(page\s*)?\d{1,4}$/i.test(trimmed)) continue;                // lone page numbers
+      const toks = trimmed.split(/\s+/), kept = toks.map(cleanToken).filter(Boolean);
+      if (!kept.length || (toks.length >= 3 && kept.length < toks.length * 0.5)) continue; // gibberish line
+      if (/^(page\s*)?\d{1,4}$/i.test(kept.join(' '))) continue;          // page number left after cleaning
+      out.push(kept.join(' '));
+    }
+    return out.join('\n');
   }
   const clean = t => t.replace(/(\w)-\n(?=[a-z])/g, '$1').replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/(?<!\n)\n(?!\n)/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
   async function extractInner(bytes, onPage) {
@@ -193,7 +229,7 @@
         setStatus(`Page ${n} of ${last} is an image, running OCR (a few seconds per page; use the page range boxes to do a chapter at a time)…`);
         out = await ocrPage(page);
       }
-      const cleaned = clean(out);
+      const cleaned = clean($('scrub').checked ? scrub(out) : out);
       if (cleaned) { acc += (acc ? '\n\n' : '') + cleaned; }
       if (onPage) onPage(acc, cleaned, n, last);
     }
