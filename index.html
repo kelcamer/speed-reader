@@ -146,16 +146,34 @@
   }
 
   // ---------- Extraction ----------
-  let cancelOcr = false, ocrWorker = null;
+  let cancelOcr = false, scheduler = null, poolReady = null, nWorkers = 1;
   $('cancel').addEventListener('click', () => { cancelOcr = true; $('cancel').classList.add('hidden'); setStatus('Stopping OCR…'); });
+  // Parallelism: one OCR worker per spare CPU core (fewer on phones). Override with ?workers=N in the URL.
+  function pickWorkers() {
+    const q = parseInt(new URLSearchParams(location.search).get('workers'));
+    if (q > 0) return Math.min(q, 8);
+    const mobile = /Android|iPhone|iPad|Mobi/i.test(navigator.userAgent);
+    return Math.max(1, Math.min(mobile ? 2 : 6, (navigator.hardwareConcurrency || 4) - 1));
+  }
+  function getPool() {
+    if (!poolReady) poolReady = (async () => {
+      if (!window.Tesseract) throw new Error('OCR engine failed to load (check your connection).');
+      nWorkers = pickWorkers();
+      scheduler = Tesseract.createScheduler();
+      // first worker alone so the language data is downloaded & cached once, then the rest in parallel
+      scheduler.addWorker(await Tesseract.createWorker('eng'));
+      const rest = await Promise.all(Array.from({ length: nWorkers - 1 }, () => Tesseract.createWorker('eng')));
+      rest.forEach(w => scheduler.addWorker(w));
+    })();
+    return poolReady;
+  }
   async function ocrPage(page) {
-    if (!window.Tesseract) throw new Error('OCR engine failed to load (check your connection).');
-    if (!ocrWorker) ocrWorker = await Tesseract.createWorker('eng');
+    await getPool();
     const base = page.getViewport({ scale: 1 });
     const vp = page.getViewport({ scale: Math.min(2.5, 2200 / Math.max(base.width, base.height)) });
     const c = document.createElement('canvas'); c.width = vp.width; c.height = vp.height;
     await page.render({ canvasContext: c.getContext('2d'), viewport: vp }).promise;
-    const { data } = await ocrWorker.recognize(c);
+    const { data } = await scheduler.addJob('recognize', c);
     c.width = c.height = 0;
     if ($('scrub').checked && data.lines && data.lines.length) {
       // keep words the OCR is sure about, plus low-scoring ones that still look like plain words (a speck can zero a real word)
@@ -167,7 +185,11 @@
     if (!window.pdfjsLib) throw new Error('PDF engine failed to load (check your connection).');
     cancelOcr = false;
     try { return await extractInner(bytes, onPage); }
-    finally { $('cancel').classList.add('hidden'); if (ocrWorker) { try { await ocrWorker.terminate(); } catch (_) {} ocrWorker = null; } }
+    finally {
+      $('cancel').classList.add('hidden');
+      const sch = scheduler; scheduler = null; poolReady = null;
+      if (sch) { try { await sch.terminate(); } catch (_) {} }
+    }
   }
   const OK_EDGE = '\\p{L}\\p{N}';
   const lead = new RegExp(`^[^${OK_EDGE}"'“‘(\\[\\-–—$]+`, 'u'), trail = new RegExp(`[^${OK_EDGE}.,;:!?"'”’)\\]%\\-–—]+$`, 'u');
@@ -203,36 +225,56 @@
   const clean = t => t.replace(/(\w)-\n(?=[a-z])/g, '$1').replace(/[ \t]+/g, ' ').replace(/ ?\n ?/g, '\n').replace(/(?<!\n)\n(?!\n)/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
   async function extractInner(bytes, onPage) {
     const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
-    let acc = '';
     const first = Math.max(1, Math.min(pdf.numPages, parseInt($('pFrom').value) || 1));
     const last = Math.max(first, Math.min(pdf.numPages, parseInt($('pTo').value) || pdf.numPages));
-    for (let n = first; n <= last; n++) {
-      setStatus(`Reading page ${n} of ${last}…`);
-      const page = await pdf.getPage(n);
-      const content = await page.getTextContent();
-      let out = '', prevY = null;
-      for (const it of content.items) {
-        if (it.str === undefined) continue;
-        const y = it.transform[5], h = it.height || 10;
-        if (prevY !== null) {
-          const gap = Math.abs(prevY - y);
-          if (gap > h * 1.9) out += '\n\n';
-          else if (gap > h * 0.5) out += '\n';
-          else if (out && !/\s$/.test(out) && !/^\s/.test(it.str)) out += ' ';
-        }
-        out += it.str;
-        if (it.str.trim()) prevY = y;
-        if (it.hasEOL && !out.endsWith('\n')) out += '\n';
+    const total = last - first + 1;
+    const results = new Map();            // page number -> raw text, released strictly in page order
+    let acc = '', nextPage = first, nextEmit = first, done = 0, usedOcr = false, failure = null;
+
+    function flush() {
+      while (results.has(nextEmit)) {
+        const out = results.get(nextEmit); results.delete(nextEmit);
+        const cleaned = clean($('scrub').checked ? scrub(out) : out);
+        if (cleaned) acc += (acc ? '\n\n' : '') + cleaned;
+        if (onPage) onPage(acc, cleaned, nextEmit, last);
+        nextEmit++;
       }
-      if (out.trim().length < 20 && !cancelOcr) {
-        $('cancel').classList.remove('hidden');
-        setStatus(`Page ${n} of ${last} is an image, running OCR (a few seconds per page; use the page range boxes to do a chapter at a time)…`);
-        out = await ocrPage(page);
-      }
-      const cleaned = clean($('scrub').checked ? scrub(out) : out);
-      if (cleaned) { acc += (acc ? '\n\n' : '') + cleaned; }
-      if (onPage) onPage(acc, cleaned, n, last);
     }
+    async function lane() {
+      while (nextPage <= last && !failure) {
+        const n = nextPage++;
+        try {
+          const page = await pdf.getPage(n);
+          const content = await page.getTextContent();
+          let out = '', prevY = null;
+          for (const it of content.items) {
+            if (it.str === undefined) continue;
+            const y = it.transform[5], h = it.height || 10;
+            if (prevY !== null) {
+              const gap = Math.abs(prevY - y);
+              if (gap > h * 1.9) out += '\n\n';
+              else if (gap > h * 0.5) out += '\n';
+              else if (out && !/\s$/.test(out) && !/^\s/.test(it.str)) out += ' ';
+            }
+            out += it.str;
+            if (it.str.trim()) prevY = y;
+            if (it.hasEOL && !out.endsWith('\n')) out += '\n';
+          }
+          if (out.trim().length < 20 && !cancelOcr) {
+            usedOcr = true; $('cancel').classList.remove('hidden');
+            out = await ocrPage(page);
+          }
+          page.cleanup();
+          results.set(n, out); done++;
+          setStatus(usedOcr ? `OCR: ${done} of ${total} pages done (${nWorkers} in parallel; use the page boxes to do a chapter at a time)…`
+                            : `Reading page ${done} of ${total}…`);
+          flush();
+        } catch (e) { failure = failure || e; }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(pickWorkers(), total) }, lane));
+    if (failure) throw failure;
+    flush();
     return acc;
   }
 
